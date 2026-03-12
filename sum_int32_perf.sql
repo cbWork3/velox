@@ -1,19 +1,24 @@
--- Performance test for SUM(int32) with SVE optimization
--- Database: tpcds_bin_partitioned_varchar_parquat_1000 (TPC-DS 1000GB)
--- Run: spark-sql --master yarn -f sum_int32_perf.sql --database tpcds_bin_partitioned_varchar_parquat_1000
+-- =============================================================================
+-- SUM(int32) SVE 性能测试 - 确保执行到 hashAggUpdateSVEWithCharForNormalInt32
+-- =============================================================================
+-- 执行方式:
+--   1. 首次: spark-sql --master yarn -f sum_int32_setup.sql  (创建表并灌数)
+--   2. 测试: spark-sql --master yarn -f sum_int32_perf.sql   (执行聚合)
 --
--- This query triggers the SVE-optimized int32 SUM path in hash aggregation:
--- - store_sales.ss_quantity is INTEGER (int32)
--- - GROUP BY creates multiple groups, using hash aggregation
--- - SUM(ss_quantity) uses the SVE-optimized sum int32 implementation
---
--- For stable performance results, run this query 3-5 times and take the median.
+-- 原理: pushdown 需 mayPushdown=true 且输入为 LazyVector
+-- REPARTITION 在 Scan 与 Aggregation 间插入 Exchange，使 mayPushdown=false
+-- =============================================================================
 
-USE tpcds_bin_partitioned_varchar_parquat_1000;
+USE sum_int32_sve_test;
 
--- Hash aggregation with SUM(int32): processes full store_sales, sums ss_quantity per store
-SELECT
-    ss_store_sk,
-    SUM(ss_quantity) AS total_quantity
-FROM store_sales
-GROUP BY ss_store_sk;
+-- 方案 A [推荐]: REPARTITION 在 Scan 与 Agg 间插入 Exchange，mayPushdown=false
+SELECT /*+ REPARTITION(200) */
+    group_key,
+    SUM(value) AS total
+FROM sum_int32_test_data
+GROUP BY group_key;
+
+-- 若 REPARTITION 无效，可尝试方案 B（取消注释）:
+-- SELECT group_key, SUM(v) AS total
+-- FROM (SELECT group_key, value + 0 AS v FROM sum_int32_test_data) t
+-- GROUP BY group_key;
