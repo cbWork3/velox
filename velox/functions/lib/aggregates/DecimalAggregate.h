@@ -95,13 +95,16 @@ class DecimalAggregate : public exec::Aggregate {
         });
       }
     } else if (decodedRaw_.mayHaveNulls()) {
-      rows.applyToSelected([&](vector_size_t i) {
-        if (decodedRaw_.isNullAt(i)) {
-          return;
-        }
-        updateNonNullValue(
-            groups[i], TResultType(decodedRaw_.valueAt<TInputType>(i)));
-      });
+      hashAggUpdateInt128(
+          groups,
+          rows.getBits(),
+          decodedRaw_.getNulls(),
+          reinterpret_cast<const TInputType*>(decodedRaw_.getData()),
+          rows.getBegin(),
+          rows.getEnd(),
+          decodedRaw_.getMode1(),
+          decodedRaw_.getmode2(),
+          reinterpret_cast<uint32_t*>(decodedRaw_.getDic()));
     } else if (!exec::Aggregate::numNulls_ && decodedRaw_.isIdentityMapping()) {
       auto data = decodedRaw_.data<TInputType>();
       rows.applyToSelected([&](vector_size_t i) {
@@ -334,6 +337,178 @@ class DecimalAggregate : public exec::Aggregate {
   }
 
  private:
+  template <typename T>
+  inline bool isBitSet(const T* bits, uint64_t idx) {
+    return bits[idx / (sizeof(bits[0]) * 8)] &
+        (static_cast<T>(1) << (idx & ((sizeof(bits[0]) * 8) - 1)));
+  }
+
+  template <typename U>
+  constexpr inline U roundUp(U value, U factor) {
+    return (value + (factor - 1)) / factor * factor;
+  }
+
+  void hashAggUpdateInt128(
+      char** groups,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      const TInputType* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    auto getValue = [&](int32_t idx) -> TInputType {
+      return (mode2 == 3) ? value[dic[idx]] : value[idx];
+    };
+
+    auto getNullBit = [&](int32_t idx) -> bool {
+      if (bitmap2 == nullptr)
+        return true;
+      switch (mode1) {
+        case 0:
+          return true;
+        case 1:
+          return isBitSet(bitmap2, static_cast<uint64_t>(idx));
+        case 2:
+          return isBitSet(bitmap2, static_cast<uint64_t>(0));
+        case 3:
+          return isBitSet(bitmap2, static_cast<uint64_t>(dic[idx]));
+        default:
+          return false;
+      }
+    };
+
+    auto processRows = [&](const int32_t* rows, int cnt) {
+      int i = 0;
+      for (; i + 3 < cnt; i += 4) {
+        char* g0 = groups[rows[i]];
+        char* g1 = groups[rows[i + 1]];
+        char* g2 = groups[rows[i + 2]];
+        char* g3 = groups[rows[i + 3]];
+
+        exec::Aggregate::clearNull(g0);
+        exec::Aggregate::clearNull(g1);
+        exec::Aggregate::clearNull(g2);
+        exec::Aggregate::clearNull(g3);
+
+        auto* acc0 = decimalAccumulator(g0);
+        auto* acc1 = decimalAccumulator(g1);
+        auto* acc2 = decimalAccumulator(g2);
+        auto* acc3 = decimalAccumulator(g3);
+
+        acc0->overflow += DecimalUtil::addWithOverflow(
+            acc0->sum, TResultType(getValue(rows[i])), acc0->sum);
+        acc1->overflow += DecimalUtil::addWithOverflow(
+            acc1->sum, TResultType(getValue(rows[i + 1])), acc1->sum);
+        acc2->overflow += DecimalUtil::addWithOverflow(
+            acc2->sum, TResultType(getValue(rows[i + 2])), acc2->sum);
+        acc3->overflow += DecimalUtil::addWithOverflow(
+            acc3->sum, TResultType(getValue(rows[i + 3])), acc3->sum);
+
+        acc0->count += 1;
+        acc1->count += 1;
+        acc2->count += 1;
+        acc3->count += 1;
+      }
+      for (; i < cnt; ++i) {
+        char* g = groups[rows[i]];
+        exec::Aggregate::clearNull(g);
+        auto* acc = decimalAccumulator(g);
+        acc->overflow += DecimalUtil::addWithOverflow(
+            acc->sum, TResultType(getValue(rows[i])), acc->sum);
+        acc->count += 1;
+      }
+    };
+
+    int32_t wordBegin = begin / 64;
+    int32_t wordEnd = (end + 63) / 64;
+
+    if (mode1 == 0 || mode1 == 1) {
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = bitmap1[w];
+        if (mode1 == 1 && bitmap2 != nullptr)
+          bits &= bitmap2[w];
+
+        if (rowBase < begin)
+          bits &= ~((1ULL << (begin - rowBase)) - 1);
+        if (rowBase + 64 > end) {
+          int shift = end - rowBase;
+          if (shift < 64)
+            bits &= (1ULL << shift) - 1;
+        }
+        if (bits == 0)
+          continue;
+
+        int32_t rows[64];
+        int cnt = 0;
+        uint64_t tmp = bits;
+        while (tmp != 0) {
+          rows[cnt++] = rowBase + __builtin_ctzll(tmp);
+          tmp &= tmp - 1;
+        }
+
+        processRows(rows, cnt);
+      }
+    } else if (mode1 == 2) {
+      if (!getNullBit(0))
+        return;
+
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = bitmap1[w];
+
+        if (rowBase < begin)
+          bits &= ~((1ULL << (begin - rowBase)) - 1);
+        if (rowBase + 64 > end) {
+          int shift = end - rowBase;
+          if (shift < 64)
+            bits &= (1ULL << shift) - 1;
+        }
+        if (bits == 0)
+          continue;
+
+        int32_t rows[64];
+        int cnt = 0;
+        uint64_t tmp = bits;
+        while (tmp != 0) {
+          rows[cnt++] = rowBase + __builtin_ctzll(tmp);
+          tmp &= tmp - 1;
+        }
+
+        processRows(rows, cnt);
+      }
+    } else {
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = bitmap1[w];
+
+        if (rowBase < begin)
+          bits &= ~((1ULL << (begin - rowBase)) - 1);
+        if (rowBase + 64 > end) {
+          int shift = end - rowBase;
+          if (shift < 64)
+            bits &= (1ULL << shift) - 1;
+        }
+        if (bits == 0)
+          continue;
+
+        int32_t rows[64];
+        int cnt = 0;
+        uint64_t tmp = bits;
+        while (tmp != 0) {
+          int32_t row = rowBase + __builtin_ctzll(tmp);
+          if (getNullBit(row))
+            rows[cnt++] = row;
+          tmp &= tmp - 1;
+        }
+
+        processRows(rows, cnt);
+      }
+    }
+  }
+
   DecodedVector decodedRaw_;
   DecodedVector decodedPartial_;
 };
