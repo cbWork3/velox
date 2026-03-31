@@ -53,14 +53,14 @@ std::unique_ptr<exec::Aggregate> constructDecimalSumAgg(
 #define PRECISION_CASE(precision)                                           \
   case precision:                                                           \
     if (inputType->isShortDecimal() && sumType->isShortDecimal()) {         \
-      return std::make_unique<exec::SimpleAggregateAdapter<                 \
-          DecimalSumAggregate<int64_t, int64_t, precision>>>(resultType);   \
+      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
+          int64_t, int64_t, precision>>(resultType);                        \
     } else if (inputType->isShortDecimal() && sumType->isLongDecimal()) {   \
-      return std::make_unique<exec::SimpleAggregateAdapter<                 \
-          DecimalSumAggregate<int64_t, int128_t, precision>>>(resultType);  \
+      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
+          int64_t, int128_t, precision>>(resultType);                       \
     } else {                                                                \
-      return std::make_unique<exec::SimpleAggregateAdapter<                 \
-          DecimalSumAggregate<int128_t, int128_t, precision>>>(resultType); \
+      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
+          int128_t, int128_t, precision>>(resultType);                      \
     }
     PRECISION_CASE(11)
     PRECISION_CASE(12)
