@@ -24,6 +24,10 @@
 #include "velox/functions/lib/aggregates/SingleValueAccumulator.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#if defined(__aarch64__)
+#include <arm_sve.h>
+#endif
+
 namespace facebook::velox::functions::aggregate {
 
 namespace {
@@ -299,6 +303,10 @@ template <>
 const double SimpleNumericMinAggregate<double>::kInitialValue_ =
     MinMaxTrait<double>::quiet_NaN();
 
+#if defined(__aarch64__)
+#include "velox/functions/lib/aggregates/MinInt64AggregateSVE.inc.h"
+#endif
+
 class MinMaxAggregateBase : public exec::Aggregate {
  public:
   explicit MinMaxAggregateBase(
@@ -564,7 +572,8 @@ template <
     template <typename T>
     class TSimpleNumericAggregate,
     template <CompareFlags::NullHandlingMode nullHandlingMode>
-    typename TAggregate>
+    typename TAggregate,
+    bool kUseSveMinInt64 = false>
 exec::AggregateFunctionFactory getMinMaxFunctionFactoryInternal(
     const std::string& name,
     CompareFlags::NullHandlingMode nullHandlingMode,
@@ -593,7 +602,14 @@ exec::AggregateFunctionFactory getMinMaxFunctionFactoryInternal(
       case TypeKind::INTEGER:
         return std::make_unique<TSimpleNumericAggregate<int32_t>>(resultType);
       case TypeKind::BIGINT:
-        return std::make_unique<TSimpleNumericAggregate<int64_t>>(resultType);
+#if defined(__aarch64__)
+        if constexpr (kUseSveMinInt64) {
+          return std::make_unique<SimpleNumericMinAggregateInt64SVE>(resultType);
+        } else
+#endif
+        {
+          return std::make_unique<TSimpleNumericAggregate<int64_t>>(resultType);
+        }
       case TypeKind::REAL:
         return std::make_unique<TSimpleNumericAggregate<float>>(resultType);
       case TypeKind::DOUBLE:
@@ -642,7 +658,8 @@ exec::AggregateFunctionFactory getMinFunctionFactory(
     TimestampPrecision precision) {
   return getMinMaxFunctionFactoryInternal<
       SimpleNumericMinAggregate,
-      MinAggregate>(name, nullHandlingMode, precision);
+      MinAggregate,
+      true>(name, nullHandlingMode, precision);
 }
 
 exec::AggregateFunctionFactory getMaxFunctionFactory(
