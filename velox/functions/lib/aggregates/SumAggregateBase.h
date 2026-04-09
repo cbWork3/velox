@@ -667,9 +667,147 @@ class SumAggregateBase
     }
   }
 
-  // int32_t -> int64_t 累加的 SVE 优化版本
-  // 鲲鹏920 SVE 256bit 下一次处理 8 个 int32_t 元素（符号扩展为 int64_t 累加）
-  // 相比 int64_t 版本，每轮可处理更多有效数据量
+  // int32_t -> int64_t 全向量化 gather/scatter SVE 版本
+  // 适用于 group-by 高基数场景（如 TPC-DS ss_item_sk ~18000），group 指针冲突概率极低
+  // 直接使用 gather-load + svadd + scatter-store，避免标量回退
+  void hashAggUpdateSVEWithCharInt32(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int32_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
+    uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+    int64_t offset = this->getOffsetFromAgg();
+
+    int32_t firstWord =
+        roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
+    int32_t lastWord = roundUp(end, 32);
+    svbool_t mask, mask1, mask2;
+
+    for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+      int32_t arr8Index = count / 8;
+      if (bitmap2_8 != nullptr) {
+        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end);
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                           : "=Upl"(mask1)
+                           : "r"(&bitmap1_8[arr8Index])
+                           : "memory");
+      mask = svand_b_z(svptrue_b8(), mask1, mask2);
+      mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
+      if (!svptest_any(svptrue_b8(), mask)) {
+        continue;
+      }
+
+      svbool_t mask00 = svunpklo(mask);
+      svbool_t mask01 = svunpkhi(mask);
+
+      if (svptest_any(svptrue_b16(), mask00)) {
+        svbool_t mask10 = svunpklo(mask00);
+        if (svptest_any(svptrue_b32(), mask10)) {
+          svint64_t valLo, valHi;
+          getValueSVE_Int32(value, mode2, mask10, count, dic, valLo, valHi);
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
+          if (svptest_any(svptrue_b64(), mask20)) {
+            svuint64_t ptr =
+                svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
+            clearNullSVE(ptr, mask20);
+            svint64_t acc = loadGatherResult(ptr, mask20, offset);
+            acc = svadd_m(mask20, acc, valLo);
+            storeScatterResult(ptr, mask20, acc, offset);
+          }
+          if (svptest_any(svptrue_b64(), mask21)) {
+            svuint64_t ptr =
+                svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
+            clearNullSVE(ptr, mask21);
+            svint64_t acc = loadGatherResult(ptr, mask21, offset);
+            acc = svadd_m(mask21, acc, valHi);
+            storeScatterResult(ptr, mask21, acc, offset);
+          }
+        }
+        svbool_t mask11 = svunpkhi(mask00);
+        if (svptest_any(svptrue_b32(), mask11)) {
+          svint64_t valLo, valHi;
+          getValueSVE_Int32(value, mode2, mask11, count + 8, dic, valLo, valHi);
+          svbool_t mask22 = svunpklo(mask11);
+          svbool_t mask23 = svunpkhi(mask11);
+          if (svptest_any(svptrue_b64(), mask22)) {
+            svuint64_t ptr =
+                svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
+            clearNullSVE(ptr, mask22);
+            svint64_t acc = loadGatherResult(ptr, mask22, offset);
+            acc = svadd_m(mask22, acc, valLo);
+            storeScatterResult(ptr, mask22, acc, offset);
+          }
+          if (svptest_any(svptrue_b64(), mask23)) {
+            svuint64_t ptr =
+                svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
+            clearNullSVE(ptr, mask23);
+            svint64_t acc = loadGatherResult(ptr, mask23, offset);
+            acc = svadd_m(mask23, acc, valHi);
+            storeScatterResult(ptr, mask23, acc, offset);
+          }
+        }
+      }
+
+      if (svptest_any(svptrue_b16(), mask01)) {
+        svbool_t mask12 = svunpklo(mask01);
+        if (svptest_any(svptrue_b32(), mask12)) {
+          svint64_t valLo, valHi;
+          getValueSVE_Int32(value, mode2, mask12, count + 16, dic, valLo, valHi);
+          svbool_t mask24 = svunpklo(mask12);
+          svbool_t mask25 = svunpkhi(mask12);
+          if (svptest_any(svptrue_b64(), mask24)) {
+            svuint64_t ptr =
+                svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
+            clearNullSVE(ptr, mask24);
+            svint64_t acc = loadGatherResult(ptr, mask24, offset);
+            acc = svadd_m(mask24, acc, valLo);
+            storeScatterResult(ptr, mask24, acc, offset);
+          }
+          if (svptest_any(svptrue_b64(), mask25)) {
+            svuint64_t ptr =
+                svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
+            clearNullSVE(ptr, mask25);
+            svint64_t acc = loadGatherResult(ptr, mask25, offset);
+            acc = svadd_m(mask25, acc, valHi);
+            storeScatterResult(ptr, mask25, acc, offset);
+          }
+        }
+        svbool_t mask13 = svunpkhi(mask01);
+        if (svptest_any(svptrue_b32(), mask13)) {
+          svint64_t valLo, valHi;
+          getValueSVE_Int32(value, mode2, mask13, count + 24, dic, valLo, valHi);
+          svbool_t mask26 = svunpklo(mask13);
+          svbool_t mask27 = svunpkhi(mask13);
+          if (svptest_any(svptrue_b64(), mask26)) {
+            svuint64_t ptr =
+                svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
+            clearNullSVE(ptr, mask26);
+            svint64_t acc = loadGatherResult(ptr, mask26, offset);
+            acc = svadd_m(mask26, acc, valLo);
+            storeScatterResult(ptr, mask26, acc, offset);
+          }
+          if (svptest_any(svptrue_b64(), mask27)) {
+            svuint64_t ptr =
+                svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
+            clearNullSVE(ptr, mask27);
+            svint64_t acc = loadGatherResult(ptr, mask27, offset);
+            acc = svadd_m(mask27, acc, valHi);
+            storeScatterResult(ptr, mask27, acc, offset);
+          }
+        }
+      }
+    }
+  }
+
+  // int32_t -> int64_t 标量回退 SVE 版本（处理低基数 group-by 场景的冲突安全路径）
   void hashAggUpdateSVEWithCharForNormalInt32(
       char** result,
       uint64_t* bitmap1,
@@ -703,20 +841,14 @@ class SumAggregateBase
         continue;
       }
 
-      // 32 bit mask -> 拆成 4 组 b16，每组再拆成 b32(8 elem) -> b64(4+4 elem)
-      // mask (b8, 32 elem) -> mask00 (b16, 16 elem lo) / mask01 (b16, 16 elem hi)
       svbool_t mask00 = svunpklo(mask);
       svbool_t mask01 = svunpkhi(mask);
 
-      // --- 处理 [count..count+15] 共16个元素 ---
       if (svptest_any(svptrue_b16(), mask00)) {
-        svbool_t mask10 = svunpklo(mask00); // b32, 8 elem [count..count+7]
+        svbool_t mask10 = svunpklo(mask00);
         if (svptest_any(svptrue_b32(), mask10)) {
-          svint64_t valLo, valHi;
-          getValueSVE_Int32(value, mode2, mask10, count, dic, valLo, valHi);
-          svbool_t mask20 = svunpklo(mask10); // b64, 4 elem [count..count+3]
-          svbool_t mask21 = svunpkhi(mask10); // b64, 4 elem [count+4..count+7]
-
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
           if (svptest_any(svptrue_b64(), mask20)) {
             svuint64_t ptr =
                 svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
@@ -731,7 +863,6 @@ class SumAggregateBase
               }
             }
           }
-
           if (svptest_any(svptrue_b64(), mask21)) {
             svuint64_t ptr =
                 svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
@@ -747,14 +878,10 @@ class SumAggregateBase
             }
           }
         }
-
-        svbool_t mask11 = svunpkhi(mask00); // b32, 8 elem [count+8..count+15]
+        svbool_t mask11 = svunpkhi(mask00);
         if (svptest_any(svptrue_b32(), mask11)) {
-          svint64_t valLo, valHi;
-          getValueSVE_Int32(value, mode2, mask11, count + 8, dic, valLo, valHi);
           svbool_t mask22 = svunpklo(mask11);
           svbool_t mask23 = svunpkhi(mask11);
-
           if (svptest_any(svptrue_b64(), mask22)) {
             svuint64_t ptr =
                 svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
@@ -769,7 +896,6 @@ class SumAggregateBase
               }
             }
           }
-
           if (svptest_any(svptrue_b64(), mask23)) {
             svuint64_t ptr =
                 svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
@@ -787,15 +913,11 @@ class SumAggregateBase
         }
       }
 
-      // --- 处理 [count+16..count+31] 共16个元素 ---
       if (svptest_any(svptrue_b16(), mask01)) {
-        svbool_t mask12 = svunpklo(mask01); // b32, 8 elem [count+16..count+23]
+        svbool_t mask12 = svunpklo(mask01);
         if (svptest_any(svptrue_b32(), mask12)) {
-          svint64_t valLo, valHi;
-          getValueSVE_Int32(value, mode2, mask12, count + 16, dic, valLo, valHi);
           svbool_t mask24 = svunpklo(mask12);
           svbool_t mask25 = svunpkhi(mask12);
-
           if (svptest_any(svptrue_b64(), mask24)) {
             svuint64_t ptr =
                 svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
@@ -810,7 +932,6 @@ class SumAggregateBase
               }
             }
           }
-
           if (svptest_any(svptrue_b64(), mask25)) {
             svuint64_t ptr =
                 svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
@@ -826,14 +947,10 @@ class SumAggregateBase
             }
           }
         }
-
-        svbool_t mask13 = svunpkhi(mask01); // b32, 8 elem [count+24..count+31]
+        svbool_t mask13 = svunpkhi(mask01);
         if (svptest_any(svptrue_b32(), mask13)) {
-          svint64_t valLo, valHi;
-          getValueSVE_Int32(value, mode2, mask13, count + 24, dic, valLo, valHi);
           svbool_t mask26 = svunpklo(mask13);
           svbool_t mask27 = svunpkhi(mask13);
-
           if (svptest_any(svptrue_b64(), mask26)) {
             svuint64_t ptr =
                 svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
@@ -848,7 +965,6 @@ class SumAggregateBase
               }
             }
           }
-
           if (svptest_any(svptrue_b64(), mask27)) {
             svuint64_t ptr =
                 svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
@@ -970,7 +1086,7 @@ class SumAggregateBase
     int mode2 = decoded.getmode2();
     vector_size_t* dic = decoded.getDic();
 
-    hashAggUpdateSVEWithCharForNormalInt32(
+    hashAggUpdateSVEWithCharInt32(
         groups,
         bitmask1,
         bitmask2,
@@ -1016,13 +1132,8 @@ class SumAggregateBase
     if (exec::Aggregate::numNulls_) {
       DecodedVector decoded(*arg, rows, !mayPushdown);
       if constexpr (std::is_same_v<TData, int64_t> && std::is_same_v<TValue, int32_t> && Overflow) {
-        if (decoded.mayHaveNulls()) {
-          updateGroupsInt32<true, TData, TValue>(
-            groups, rows, arg, &updateSingleValue<TData>, false, decoded);
-        } else {
-          BaseAggregate::template updateGroups<true, TData, TValue>(
-            groups, rows, arg, &updateSingleValue<TData>, false);
-        }
+        updateGroupsInt32<true, TData, TValue>(
+          groups, rows, arg, &updateSingleValue<TData>, false, decoded);
       } else if (std::is_same_v<TData, int64_t> && std::is_same_v<TValue, int64_t> && decoded.mayHaveNulls() && Overflow) {
         updateGroups<true, TData, TValue>(
           groups, rows, arg, &updateSingleValue<TData>, false, decoded);
@@ -1031,8 +1142,14 @@ class SumAggregateBase
           groups, rows, arg, &updateSingleValue<TData>, false);
       }
     } else {
-      BaseAggregate::template updateGroups<false, TData, TValue>(
-          groups, rows, arg, &updateSingleValue<TData>, false);
+      if constexpr (std::is_same_v<TData, int64_t> && std::is_same_v<TValue, int32_t> && Overflow) {
+        DecodedVector decoded(*arg, rows, !mayPushdown);
+        updateGroupsInt32<false, TData, TValue>(
+          groups, rows, arg, &updateSingleValue<TData>, false, decoded);
+      } else {
+        BaseAggregate::template updateGroups<false, TData, TValue>(
+            groups, rows, arg, &updateSingleValue<TData>, false);
+      }
     }
   }
 
