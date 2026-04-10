@@ -340,13 +340,15 @@ class OptimizedSparkDecimalSumAggregate
         svbool_t pg64to32 = svuzp1_b8(pg, svpfalse());
         svuint32_t dicIdx = svld1(pg64to32, dic + rowIndex);
         svuint64_t dicIdx64 = svunpklo(dicIdx);
-        // Scale index by 16 (sizeof(int128_t)) to get byte offset.
-        // svld1_gather_u64offset_s64(pg, scalar_base, uint64_offsets)
+        // Scale index by 16 (sizeof(int128_t)) to get byte offset, then load
+        // lo64 at byteOff+0 and hi64 at byteOff+8.
         svuint64_t byteOff = svlsl_x(pg, dicIdx64, 4);
-        const int64_t* base = reinterpret_cast<const int64_t*>(rawValue);
-        outLo = svld1_gather_u64offset_s64(pg, base, byteOff);
-        svuint64_t byteOffHi = svadd_x(pg, byteOff, (uint64_t)8);
-        outHi = svld1_gather_u64offset_s64(pg, base, byteOffHi);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(rawValue);
+        outLo = svld1_gather_offset_s64(
+            pg, reinterpret_cast<const int64_t*>(base), byteOff);
+        svuint64_t byteOffHi = svadd_x(pg, byteOff, 8);
+        outHi = svld1_gather_offset_s64(
+            pg, reinterpret_cast<const int64_t*>(base), byteOffHi);
       } else {
         // Identity/constant: contiguous load.
         const int64_t* p =
@@ -364,7 +366,7 @@ class OptimizedSparkDecimalSumAggregate
         svbool_t pg64to32 = svuzp1_b8(pg, svpfalse());
         svuint32_t dicIdx = svld1(pg64to32, dic + rowIndex);
         svuint64_t dicIdx64 = svunpklo(dicIdx);
-        val64 = svld1_gather_u64index_s64(
+        val64 = svld1_gather_index(
             pg, reinterpret_cast<const int64_t*>(rawValue), dicIdx64);
       } else if (mode2 == 2) {
         val64 = svdup_n_s64(
@@ -425,27 +427,24 @@ class OptimizedSparkDecimalSumAggregate
     svbool_t bothNeg = svand_b_z(pg, sameSign, lhsNeg);
 
     // For both-negative: abs(x) = ~x + 1 (two's complement negate 128-bit)
-    svuint64_t absLhsLo = uLhsLo;
-    svuint64_t absLhsHi = uLhsHi;
-    svuint64_t absRhsLo = uRhsLo;
-    svuint64_t absRhsHi = uRhsHi;
-
-    // Negate under bothNeg mask
-    svuint64_t negLhsLo = svadd_m(bothNeg, svnot_m(bothNeg, absLhsLo), 1);
+    // svnot_u64_x: inactive lanes are don't-care (we select via svsel later)
+    svuint64_t notLhsLo = svnot_u64_x(bothNeg, uLhsLo);
+    svuint64_t negLhsLo = svadd_m(bothNeg, notLhsLo, 1);
     svbool_t negLhsCarry = svcmpeq(bothNeg, negLhsLo, (uint64_t)0);
-    svuint64_t negLhsHi = svnot_m(bothNeg, absLhsHi);
+    svuint64_t negLhsHi = svnot_u64_x(bothNeg, uLhsHi);
     negLhsHi = svadd_m(negLhsCarry, negLhsHi, 1);
 
-    svuint64_t negRhsLo = svadd_m(bothNeg, svnot_m(bothNeg, absRhsLo), 1);
+    svuint64_t notRhsLo = svnot_u64_x(bothNeg, uRhsLo);
+    svuint64_t negRhsLo = svadd_m(bothNeg, notRhsLo, 1);
     svbool_t negRhsCarry = svcmpeq(bothNeg, negRhsLo, (uint64_t)0);
-    svuint64_t negRhsHi = svnot_m(bothNeg, absRhsHi);
+    svuint64_t negRhsHi = svnot_u64_x(bothNeg, uRhsHi);
     negRhsHi = svadd_m(negRhsCarry, negRhsHi, 1);
 
     // Select abs values: for bothNeg use negated, for bothPos use original
-    svuint64_t aLo = svsel(bothNeg, negLhsLo, absLhsLo);
-    svuint64_t aHi = svsel(bothNeg, negLhsHi, absLhsHi);
-    svuint64_t bLo = svsel(bothNeg, negRhsLo, absRhsLo);
-    svuint64_t bHi = svsel(bothNeg, negRhsHi, absRhsHi);
+    svuint64_t aLo = svsel(bothNeg, negLhsLo, uLhsLo);
+    svuint64_t aHi = svsel(bothNeg, negLhsHi, uLhsHi);
+    svuint64_t bLo = svsel(bothNeg, negRhsLo, uRhsLo);
+    svuint64_t bHi = svsel(bothNeg, negRhsHi, uRhsHi);
 
     // Unsigned 128-bit add of abs values
     svuint64_t sumLo = svadd_m(sameSign, aLo, bLo);
@@ -464,9 +463,10 @@ class OptimizedSparkDecimalSumAggregate
     svuint64_t finalSameLo = sumLo;
     svuint64_t finalSameHi = maskedHi;
 
-    svuint64_t reNegLo = svadd_m(bothNeg, svnot_m(bothNeg, finalSameLo), 1);
+    svuint64_t notResLo = svnot_u64_x(bothNeg, finalSameLo);
+    svuint64_t reNegLo = svadd_m(bothNeg, notResLo, 1);
     svbool_t reNegCarry = svcmpeq(bothNeg, reNegLo, (uint64_t)0);
-    svuint64_t reNegHi = svnot_m(bothNeg, finalSameHi);
+    svuint64_t reNegHi = svnot_u64_x(bothNeg, finalSameHi);
     reNegHi = svadd_m(reNegCarry, reNegHi, 1);
 
     finalSameLo = svsel(bothNeg, reNegLo, finalSameLo);
@@ -478,7 +478,7 @@ class OptimizedSparkDecimalSumAggregate
 
     // Overflow: +1 for both-positive, -1 for both-negative, 0 for diff-sign
     svint64_t posOvf = svreinterpret_s64(overflowBit);
-    svint64_t negOvf = svneg_m(posOvf, bothNeg, posOvf);
+    svint64_t negOvf = svneg_s64_m(posOvf, bothNeg, posOvf);
     overflow = svsel(sameSign, negOvf, svdup_s64(0));
   }
 
