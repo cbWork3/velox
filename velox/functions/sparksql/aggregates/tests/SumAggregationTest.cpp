@@ -486,5 +486,137 @@ TEST_F(SumAggregationTest, sumFloat) {
       {"spark_sum(c0)"},
       "SELECT sum(c0) FROM tmp");
 }
+
+// Tests exercising the SVE/scalar density-based dispatch in
+// OptimizedSparkDecimalSumAggregate. Dense batches (>= 8 active rows per
+// 32-row block) take the SVE vectorized path; sparse batches fall back to
+// the scalar CTZ+unroll path.
+
+TEST_F(SumAggregationTest, sveDenseLongDecimalSum) {
+  // 128 rows, all non-null => every 32-row block is fully dense, triggers SVE.
+  constexpr int kRows = 128;
+  std::vector<std::optional<int128_t>> values;
+  values.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    values.emplace_back(HugeInt::build(0, i + 1));
+  }
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int128_t>(values, DECIMAL(30, 2))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {}, {"spark_sum(c0)"}, "SELECT sum(c0) FROM tmp");
+}
+
+TEST_F(SumAggregationTest, sveDenseShortToLongDecimalSum) {
+  // Short decimal input with long decimal sum, 200 rows, dense.
+  constexpr int kRows = 200;
+  std::vector<std::optional<int64_t>> values;
+  values.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    values.emplace_back(static_cast<int64_t>((i % 2 == 0 ? 1 : -1) * (i + 1)));
+  }
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int64_t>(values, DECIMAL(17, 2))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {}, {"spark_sum(c0)"}, "SELECT sum(c0) FROM tmp");
+}
+
+TEST_F(SumAggregationTest, sveSparseWithNulls) {
+  // Sparse data: mostly nulls => popcount < threshold, triggers scalar path.
+  constexpr int kRows = 128;
+  std::vector<std::optional<int128_t>> values;
+  values.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    if (i % 20 == 0) {
+      values.emplace_back(HugeInt::build(1, i));
+    } else {
+      values.emplace_back(std::nullopt);
+    }
+  }
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int128_t>(values, DECIMAL(30, 2))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {}, {"spark_sum(c0)"}, "SELECT sum(c0) FROM tmp");
+}
+
+TEST_F(SumAggregationTest, sveMixedSignOverflow) {
+  // Mix of large positive and negative values that cancel out.
+  // Tests the SVE addWithOverflow same-sign / diff-sign path selection.
+  std::vector<std::optional<int128_t>> values;
+  int128_t bigPos = DecimalUtil::kLongDecimalMax / 2;
+  int128_t bigNeg = DecimalUtil::kLongDecimalMin / 2;
+  for (int i = 0; i < 64; ++i) {
+    values.emplace_back(i % 2 == 0 ? bigPos : bigNeg);
+  }
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int128_t>(values, DECIMAL(38, 0))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {}, {"spark_sum(c0)"}, "SELECT sum(c0) FROM tmp");
+}
+
+TEST_F(SumAggregationTest, sveDenseGroupBy) {
+  // Group-by with dense data, multiple 32-row blocks per group.
+  constexpr int kRows = 256;
+  std::vector<int32_t> keys;
+  std::vector<std::optional<int128_t>> values;
+  keys.reserve(kRows);
+  values.reserve(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    keys.push_back(i % 8);
+    values.emplace_back(HugeInt::build(0, (i + 1) * 100));
+  }
+  auto input = makeRowVector(
+      {makeFlatVector<int32_t>(keys),
+       makeNullableFlatVector<int128_t>(values, DECIMAL(30, 2))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {"c0"}, {"spark_sum(c1)"}, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+}
+
+TEST_F(SumAggregationTest, sveBothNegativeOverflow) {
+  // Two large negative values that overflow via the both-negative SVE path.
+  std::vector<std::optional<int128_t>> values;
+  values.emplace_back(DecimalUtil::kLongDecimalMin);
+  values.emplace_back(DecimalUtil::kLongDecimalMin);
+  decimalGlobalSumOverflow(values, {std::nullopt});
+}
+
+TEST_F(SumAggregationTest, sveBothPositiveOverflow) {
+  // Two large positive values that overflow via the both-positive SVE path.
+  std::vector<std::optional<int128_t>> values;
+  values.emplace_back(DecimalUtil::kLongDecimalMax);
+  values.emplace_back(DecimalUtil::kLongDecimalMax);
+  decimalGlobalSumOverflow(values, {std::nullopt});
+}
+
+TEST_F(SumAggregationTest, sveLargeBatchMixedDensity) {
+  // Large batch with alternating dense and sparse regions within the same
+  // column. First 64 rows are dense, next 64 are mostly null, then 64 dense
+  // again. This exercises the per-block density dispatch.
+  constexpr int kRows = 192;
+  std::vector<std::optional<int128_t>> values;
+  values.reserve(kRows);
+  for (int i = 0; i < 64; ++i) {
+    values.emplace_back(HugeInt::build(0, i + 1));
+  }
+  for (int i = 0; i < 64; ++i) {
+    if (i % 16 == 0) {
+      values.emplace_back(HugeInt::build(0, 1000 + i));
+    } else {
+      values.emplace_back(std::nullopt);
+    }
+  }
+  for (int i = 0; i < 64; ++i) {
+    values.emplace_back(HugeInt::build(0, 2000 + i));
+  }
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int128_t>(values, DECIMAL(30, 2))});
+  createDuckDbTable({input});
+  testAggregations(
+      {input}, {}, {"spark_sum(c0)"}, "SELECT sum(c0) FROM tmp");
+}
 } // namespace
 } // namespace facebook::velox::functions::aggregate::sparksql::test
